@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import itertools
 import re
 from typing import Generator
 from typing import Iterable
@@ -12,6 +13,7 @@ from typing import Tuple
 
 from tokenize_rt import Offset
 from tokenize_rt import Token
+from tokenize_rt import src_to_tokens
 from tokenize_rt import tokens_to_src
 
 from pyupgrade._ast_helpers import ast_to_offset
@@ -22,6 +24,11 @@ from pyupgrade._string_helpers import curly_escape
 from pyupgrade._token_helpers import KEYWORDS
 from pyupgrade._token_helpers import remove_brace
 from pyupgrade._token_helpers import victims
+
+try:
+    astunparse = ast.unparse
+except AttributeError:
+    from astunparse import unparse as astunparse
 
 PercentFormatPart = Tuple[
     Optional[str],
@@ -228,6 +235,35 @@ def _fix_percent_format_dict(
     tokens[i] = tokens[i]._replace(src=newsrc)
     tokens[i + 1:brace + 1] = [Token('CODE', '.format'), Token('OP', '(')]
 
+def _turn_into_format_tuple(
+        i: int,
+        tokens: list[Token],
+        *,
+        node_right: ast.Node,
+) -> None:
+    token_alignment = next(index for index, token in enumerate(token for token in itertools.islice(tokens, i, None)) if token.src == "%")
+    node_start = i + token_alignment + 2
+    if tokens_to_src(tokens[i + token_alignment:node_start + 1]) == '% (':
+        fmt_victims = victims(tokens, node_start, node_right, gen=False)
+        tokens.insert(fmt_victims.ends[0], Token("OP", ","))
+        return
+
+    if isinstance(node_right, ast.Call):
+        percent_alignment = next(index for index, token in enumerate(token for token in itertools.islice(tokens, node_start, None)) if token.src == "(")
+        print(percent_alignment)
+        fmt_victims = victims(tokens, node_start + percent_alignment, node_right, gen=False)
+        print(fmt_victims)
+        tokens.insert(fmt_victims.ends[0] + 1, Token("OP", ")"))
+        tokens.insert(fmt_victims.ends[0] + 1, Token("OP", ","))
+        tokens.insert(node_start, Token("OP", "("))
+        return
+
+
+    node_src = astunparse(node_right).strip()
+    node_tokens = src_to_tokens(node_src)
+    tokens[node_start:node_start - 2+len(node_tokens)] = src_to_tokens(f"({node_src},)")[:-2]
+
+
 
 @register(ast.BinOp)
 def visit_BinOp(
@@ -253,7 +289,7 @@ def visit_BinOp(
                 if width == '*' or precision == '.*':
                     break
                 # these conversions require modification of parameters
-                if conversion in {'d', 'i', 'u', 'c'}:
+                if conversion in {'i', 'u', 'c'}:
                     break
                 # timid: py2: %#o formats different from {:#o} (--py3?)
                 if '#' in (conversion_flag or '') and conversion == 'o':
@@ -284,6 +320,12 @@ def visit_BinOp(
                 elif isinstance(node.right, ast.Dict):
                     func = functools.partial(
                         _fix_percent_format_dict,
+                        node_right=node.right,
+                    )
+                    yield ast_to_offset(node), func
+                elif isinstance(node.right, (ast.Name, ast.Attribute, ast.Call)):
+                    func = functools.partial(
+                        _turn_into_format_tuple,
                         node_right=node.right,
                     )
                     yield ast_to_offset(node), func
